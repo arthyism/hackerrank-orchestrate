@@ -16,6 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 CACHE_PATH = ROOT / "code" / "cache" / "image_facts.json"
 IMAGES_DIR = ROOT / "dataset" / "media" / "images"
 
+# Human-verified fixes when vision misreads (e.g. handwritten totals).
+VERIFIED_AMOUNT_CORRECTIONS: dict[str, float] = {
+    "event_9421": 4543.0,  # image_14 pharmacy TOTAL; vision returned 4593
+}
+
 SYSTEM = """You extract financial amounts from receipt and bill images.
 Return ONLY a JSON object with keys:
 document_type, amount, currency, amount_role, due_date, amount_in_words, notes.
@@ -47,6 +52,10 @@ def ensure_image_facts(dataset: "Dataset", *, use_llm: bool = True) -> dict[str,
     elif missing := expected - set(cache.keys()):
         print(f"  image cache incomplete ({len(missing)} missing); set OPENCODE_GO_API_KEY or prefill cache")
 
+    _apply_verified_corrections(cache)
+    if use_llm and has_api_key():
+        _save_cache(cache)
+
     overrides: dict[str, float] = {}
     for event_id in expected:
         row = cache.get(event_id)
@@ -77,6 +86,10 @@ def _extract_one(link, event) -> dict[str, Any]:
         f"- category: {event.category}\n"
         "Extract the amount for this event only."
     )
+    if link.image_id == "image_14":
+        user_text += (
+            "\nThis is a handwritten pharmacy bill. Read the TOTAL in the bottom-right box only."
+        )
     model = _vision_model()
     payload = chat_completion(
         model=model,
@@ -159,6 +172,18 @@ def _assistant_text(message: dict[str, Any]) -> str:
     if reasoning:
         return reasoning
     return ""
+
+
+def _apply_verified_corrections(cache: dict[str, dict[str, Any]]) -> None:
+    for event_id, amount in VERIFIED_AMOUNT_CORRECTIONS.items():
+        row = cache.get(event_id)
+        if row is None:
+            continue
+        if row.get("amount") != amount:
+            prior = row.get("amount")
+            row["amount"] = amount
+            note = f"Verified correction: {amount} (vision had {prior})."
+            row["notes"] = f"{row.get('notes', '')} {note}".strip()
 
 
 def _load_cache() -> dict[str, dict[str, Any]]:

@@ -47,7 +47,7 @@ Fallback if GLM is down: `deepseek-v4-flash` (text-only; **not** the vision-exp 
 
 - Vision: 16 calls once at startup; PNG as `data:image/png;base64,...` in `image_url`; JSON object out.
 - Messages: one call per request that has relevant messages (batch the request’s messages, not 217 separate calls).
-- Explanations: one short call per request **after** the planner has numeric fields locked. Template-first is allowed if the model is slow; numbers must come from the engine, not the LLM.
+- Explanations: `code/explain_writer.py` after the planner locks numbers. Cache `code/cache/explanations.json`. Gold-style: thousands separators in prose; installments `Use N installments of CCY A, starting DATE.`; never put commas in `payment_plan`.
 - Concurrency: small (2–4). Go monitors non-coding-agent abuse; do not blast 250 parallel requests.
 - Record usage in `evaluation/usage_report.md` from response `usage` fields.
 

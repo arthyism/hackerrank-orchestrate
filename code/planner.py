@@ -14,6 +14,7 @@ def decide(ctx: RequestContext) -> Decision:
     profile = ctx.profile
     safe_today = amount_safe_today(ctx)
     earliest = earliest_full_payment(ctx)
+    earliest_no_changes = earliest
     considered = set(profile.payment_methods_user_will_consider)
     plans: list[Plan] = []
 
@@ -21,16 +22,16 @@ def decide(ctx: RequestContext) -> Decision:
     plans.extend(_partial_plans(ctx, considered, safe_today, earliest))
     plans.extend(_installment_plans(ctx, considered))
     plans.extend(_wait_plans(ctx, considered, earliest))
-
-    if not plans:
-        plans.extend(_spending_change_full(ctx, considered))
+    # Always enumerate spending-change plans. Rank prefers zero changes
+    # when a no-change plan already stays above the minimum.
+    plans.extend(_spending_change_full(ctx, considered))
 
     ranked = [plan for plan in plans if plan.method]
     if not ranked:
         return _not_recommended(ctx, safe_today, earliest)
 
     winner = min(ranked, key=lambda plan: _rank_key(plan, request.desired_completion_date))
-    return _to_decision(ctx, winner, safe_today, earliest)
+    return _to_decision(ctx, winner, safe_today, earliest, earliest_no_changes)
 
 
 def _full_payment_plans(
@@ -39,7 +40,11 @@ def _full_payment_plans(
     if "full_payment" not in considered:
         return []
     request = ctx.request
-    ok, _ = simulate(ctx, extra_debits=[(request.request_date, request.requested_amount)])
+    ok, _ = simulate(
+        ctx,
+        extra_debits=[(request.request_date, request.requested_amount)],
+        conservative=True,
+    )
     if not ok:
         return []
     return [
@@ -70,7 +75,7 @@ def _partial_plans(
         return []
     remainder = round(request.requested_amount - safe_today, 2)
     payments = [(request.request_date, safe_today), (earliest, remainder)]
-    ok, _ = simulate(ctx, extra_debits=payments)
+    ok, _ = simulate(ctx, extra_debits=payments, conservative=True)
     if not ok:
         return []
     return [
@@ -129,7 +134,7 @@ def _wait_plans(
     if earliest > ctx.request.desired_completion_date:
         return []
     payments = [(earliest, ctx.request.requested_amount)]
-    ok, _ = simulate(ctx, extra_debits=payments)
+    ok, _ = simulate(ctx, extra_debits=payments, conservative=True)
     if not ok:
         return []
     status = (
@@ -155,7 +160,44 @@ def _spending_change_full(ctx: RequestContext, considered: set[str]) -> list[Pla
     candidates = _change_candidates(ctx)
     if not candidates:
         return []
-    # Try stopping largest stoppable series first, then reductions.
+    plans: list[Plan] = []
+    seen_changes: set[tuple[str, ...]] = set()
+
+    def add_plan(stopped: set[str], reduced: dict[str, float], changes: list[str]) -> None:
+        if not changes:
+            return
+        key = tuple(changes)
+        if key in seen_changes:
+            return
+        ok, _ = simulate(
+            ctx,
+            extra_debits=[(request.request_date, request.requested_amount)],
+            stopped_event_ids=stopped,
+            reduced=reduced,
+        )
+        if not ok:
+            return
+        seen_changes.add(key)
+        plans.append(
+            Plan(
+                method="full_payment",
+                payments=[(request.request_date, request.requested_amount)],
+                spending_changes=changes[:3],
+                total_paid=request.requested_amount,
+                status="affordable_with_plan",
+            )
+        )
+
+    for kind, flow in candidates:
+        if kind == "stop":
+            base = flow.event_id.split(":proj:")[0]
+            add_plan({base}, {}, [f"stop:{base}"])
+        elif kind == "reduce" and flow.minimum_allowed_amount is not None:
+            base = flow.event_id.split(":proj:")[0]
+            amt = flow.minimum_allowed_amount
+            add_plan(set(), {base: amt}, [f"reduce_to:{base}:{_fmt_amount(amt)}"])
+
+    # Greedy multi-change path (stop then reduce) for rows like request_21.
     stopped: set[str] = set()
     reduced: dict[str, float] = {}
     changes: list[str] = []
@@ -163,17 +205,18 @@ def _spending_change_full(ctx: RequestContext, considered: set[str]) -> list[Pla
         if len(changes) >= 3:
             break
         if kind == "stop":
-            trial_stop = set(stopped) | {flow.event_id.split(":proj:")[0]}
+            base = flow.event_id.split(":proj:")[0]
+            trial_stop = set(stopped) | {base}
             ok, _ = simulate(
                 ctx,
                 extra_debits=[(request.request_date, request.requested_amount)],
                 stopped_event_ids=trial_stop,
                 reduced=reduced,
             )
+            if not ok:
+                continue
             stopped = trial_stop
-            changes.append(f"stop:{flow.event_id.split(':proj:')[0]}")
-            if ok:
-                break
+            changes.append(f"stop:{base}")
         elif kind == "reduce" and flow.minimum_allowed_amount is not None:
             base = flow.event_id.split(":proj:")[0]
             trial_reduced = dict(reduced)
@@ -184,32 +227,14 @@ def _spending_change_full(ctx: RequestContext, considered: set[str]) -> list[Pla
                 stopped_event_ids=stopped,
                 reduced=trial_reduced,
             )
+            if not ok:
+                continue
             reduced = trial_reduced
             changes.append(
                 f"reduce_to:{base}:{_fmt_amount(flow.minimum_allowed_amount)}"
             )
-            if ok:
-                break
-
-    if not changes:
-        return []
-    ok, _ = simulate(
-        ctx,
-        extra_debits=[(request.request_date, request.requested_amount)],
-        stopped_event_ids=stopped,
-        reduced=reduced,
-    )
-    if not ok:
-        return []
-    return [
-        Plan(
-            method="full_payment",
-            payments=[(request.request_date, request.requested_amount)],
-            spending_changes=changes[:3],
-            total_paid=request.requested_amount,
-            status="affordable_with_plan",
-        )
-    ]
+    add_plan(stopped, reduced, changes)
+    return plans
 
 
 def _change_candidates(ctx: RequestContext) -> list[tuple[str, CashFlow]]:
@@ -258,7 +283,15 @@ def _rank_key(plan: Plan, deadline: date) -> tuple:
     start = plan.start_date or date.max
     n_pay = len(plan.payments) if plan.payments else 99
     option_num = int("".join(ch for ch in plan.option_id if ch.isdigit()) or "999999")
-    return (completes, changes, plan.total_paid, start, n_pay, option_num)
+    # Spec: minimize total paid — partial beats fee-bearing installments at same deadline.
+    method_order = {
+        "full_payment": 0,
+        "partial_payment": 1,
+        "installments": 2,
+        "wait": 3,
+        "not_recommended": 9,
+    }
+    return (completes, changes, plan.total_paid, method_order.get(plan.method, 5), start, n_pay, option_num)
 
 
 def _not_recommended(ctx: RequestContext, safe_today: float, earliest: Optional[date]) -> Decision:
@@ -275,7 +308,11 @@ def _not_recommended(ctx: RequestContext, safe_today: float, earliest: Optional[
 
 
 def _to_decision(
-    ctx: RequestContext, plan: Plan, safe_today: float, earliest: Optional[date]
+    ctx: RequestContext,
+    plan: Plan,
+    safe_today: float,
+    earliest: Optional[date],
+    earliest_no_changes: Optional[date] = None,
 ) -> Decision:
     request = ctx.request
     status = plan.status
@@ -284,9 +321,13 @@ def _to_decision(
             status = "affordable_now"
         elif plan.spending_changes:
             status = "affordable_with_plan"
+    if plan.method == "full_payment" and plan.spending_changes:
+        status = "affordable_with_plan"
     if plan.method == "wait":
         status = "affordable_later"
     earliest_str = earliest.isoformat() if earliest else ""
+    if plan.spending_changes and earliest_no_changes:
+        earliest_str = earliest_no_changes.isoformat()
     if status == "affordable_now":
         earliest_str = request.request_date.isoformat()
     return Decision(
@@ -315,10 +356,18 @@ def _fmt_amount(value: float) -> str:
     return text
 
 
+def _fmt_explain_amount(value: float) -> str:
+    raw = _fmt_amount(value)
+    if "." in raw:
+        whole, frac = raw.split(".", 1)
+        return f"{int(whole):,}.{frac}"
+    return f"{int(raw):,}"
+
+
 def _explain(ctx: RequestContext, plan: Plan) -> str:
     ccy = ctx.profile.home_currency
-    floor = _fmt_amount(ctx.profile.minimum_balance_to_keep)
-    amount = _fmt_amount(ctx.request.requested_amount)
+    floor = _fmt_explain_amount(ctx.profile.minimum_balance_to_keep)
+    amount = _fmt_explain_amount(ctx.request.requested_amount)
     if plan.method == "full_payment" and not plan.spending_changes:
         return (
             f"Pay {ccy} {amount} today. This leaves at least {ccy} {floor} "
@@ -331,15 +380,15 @@ def _explain(ctx: RequestContext, plan: Plan) -> str:
         )
     if plan.method == "installments":
         n = len(plan.payments)
-        each = _fmt_amount(plan.payments[0][1])
+        each = _fmt_explain_amount(plan.payments[0][1])
         start = plan.payments[0][0].strftime("%-d %B %Y") if plan.payments else ""
         return (
             f"Use {n} installments of {ccy} {each}, starting {start}. "
             f"This leaves at least {ccy} {floor} available."
         )
     if plan.method == "partial_payment":
-        first = _fmt_amount(plan.payments[0][1])
-        second = _fmt_amount(plan.payments[1][1])
+        first = _fmt_explain_amount(plan.payments[0][1])
+        second = _fmt_explain_amount(plan.payments[1][1])
         day = plan.payments[1][0].strftime("%-d %B %Y")
         return (
             f"Pay {ccy} {first} today and the remaining {ccy} {second} on {day}. "
@@ -348,21 +397,21 @@ def _explain(ctx: RequestContext, plan: Plan) -> str:
     if plan.method == "wait":
         day = plan.payments[0][0].strftime("%-d %B %Y")
         return (
-            f"Wait until {day}, then pay {ccy} {amount} in full. "
-            f"Paying sooner would put the {ccy} {floor} minimum at risk."
+            f"Pay {ccy} {amount} in full on {day}. "
+            f"Paying earlier would take the balance below the {ccy} {floor} minimum."
         )
     return _explain_not_recommended(ctx, amount_safe_today(ctx))
 
 
 def _explain_not_recommended(ctx: RequestContext, safe_today: float) -> str:
     ccy = ctx.profile.home_currency
-    floor = _fmt_amount(ctx.profile.minimum_balance_to_keep)
+    floor = _fmt_explain_amount(ctx.profile.minimum_balance_to_keep)
     deadline = ctx.request.desired_completion_date.strftime("%-d %B %Y")
-    requested = _fmt_amount(ctx.request.requested_amount)
+    requested = _fmt_explain_amount(ctx.request.requested_amount)
     if safe_today > 0:
         return (
             f"Do not proceed with the {ccy} {requested} request. Although "
-            f"{ccy} {_fmt_amount(safe_today)} is available today, the full amount cannot "
+            f"{ccy} {_fmt_explain_amount(safe_today)} is available today, the full amount cannot "
             f"be completed safely within 90 days."
         )
     return (

@@ -8,6 +8,7 @@ from statistics import median
 from typing import Optional
 
 from data_loader import Dataset
+from exp_flags import FLAGS
 from models import CashFlow, Event, RequestContext
 
 IGNORE_STATUS = {"cancelled", "failed", "unrealized"}
@@ -28,6 +29,8 @@ def build_cashflows(dataset: Dataset, ctx: RequestContext) -> list[CashFlow]:
             continue
         if event.direction == "non_cash":
             continue
+        if ctx.evidence and event.event_id in ctx.evidence.cancel_event_ids:
+            continue
         settle = event.settlement_date or event.event_date
         if settle is None:
             continue
@@ -44,6 +47,10 @@ def build_cashflows(dataset: Dataset, ctx: RequestContext) -> list[CashFlow]:
             amount = override
         else:
             amount = event.amount
+        if ctx.evidence and event.event_id in ctx.evidence.event_amount_overrides:
+            amount = ctx.evidence.event_amount_overrides[event.event_id]
+        if _is_monthly_rent(event) and ctx.evidence and ctx.evidence.rent_increase_percent:
+            amount *= 1 + ctx.evidence.rent_increase_percent / 100.0
         home_amount = dataset.convert(
             amount, event.currency, profile.home_currency, settle.isoformat()
         )
@@ -168,14 +175,19 @@ def _project_recurring(
                 event.amount, event.currency, ctx.profile.home_currency, settle.isoformat()
             )
             amounts.append(home)
-        conservative = amounts[-1]
-        cursor = dates[-1] + timedelta(days=gap)
+        bill_amount = amounts[-1]
+        if _is_monthly_rent(last) and ctx.evidence and ctx.evidence.rent_increase_percent:
+            bill_amount *= 1 + ctx.evidence.rent_increase_percent / 100.0
+        # Calendar months, not median-gap days. A 30-day step from the 4th
+        # lands on the 3rd and drops the request-month bill.
+        months = 1 if 26 <= gap <= 35 else 3
+        cursor = _add_months(dates[-1], months)
         series_index = 0
         while cursor <= horizon:
             if cursor >= request_date and (key, cursor) not in covered:
                 nearby = any(abs((cursor - day).days) <= 3 and sk == key for sk, day in covered)
                 if not nearby:
-                    signed = conservative if last.direction == "credit" else -conservative
+                    signed = -bill_amount
                     projected.append(
                         CashFlow(
                             on_date=cursor,
@@ -194,9 +206,37 @@ def _project_recurring(
                             description=last.description,
                         )
                     )
-            cursor += timedelta(days=gap)
+            cursor = _add_months(cursor, months)
             series_index += 1
     return projected
+
+
+def _typical_salary_home(
+    dataset: Dataset, ctx: RequestContext, salaries: list[Event]
+) -> Optional[float]:
+    """Recurring pay after a one-cycle dip (unpaid leave), not the dipped amount."""
+    settled = [
+        event
+        for event in salaries
+        if event.status == "settled"
+        and event.amount is not None
+        and "prorated" not in event.description.lower()
+    ]
+    if len(settled) < 2:
+        return None
+    homes: list[float] = []
+    for event in settled:
+        settle = event.settlement_date or event.event_date
+        homes.append(
+            dataset.convert(
+                event.amount, event.currency, ctx.profile.home_currency, settle.isoformat()
+            )
+        )
+    peak = max(homes)
+    regular = [amt for amt in homes if amt + 1e-6 >= 0.75 * peak]
+    if len(regular) < 2:
+        return None
+    return float(median(regular))
 
 
 def _is_final_payroll(event: Event) -> bool:
@@ -249,6 +289,12 @@ def _project_salary(
         and event.amount is not None
         and not (facts and event.event_id in facts.ignore_event_ids)
     ]
+    first_override = None
+    if facts and facts.next_salary_amount:
+        ccy = facts.next_salary_currency or ctx.profile.home_currency
+        first_override = dataset.convert(
+            facts.next_salary_amount, ccy, ctx.profile.home_currency, request_date.isoformat()
+        )
     if facts and facts.salary_amount and facts.salary_amount > 0 and ctx.messages:
         from_date = facts.salary_from_date or facts.salary_payday or request_date
         ccy = facts.salary_currency or ctx.profile.home_currency
@@ -256,7 +302,9 @@ def _project_salary(
             facts.salary_amount, ccy, ctx.profile.home_currency, from_date.isoformat()
         )
         anchor = facts.salary_payday or from_date
-        return _salary_series(amount_home, anchor, covered, request_date, horizon, "evidence")
+        return _salary_series(
+            amount_home, anchor, covered, request_date, horizon, "evidence", first_override
+        )
     if not salaries:
         return []
     salaries.sort(key=lambda e: e.settlement_date or e.event_date)
@@ -273,10 +321,22 @@ def _project_salary(
         ctx.profile.home_currency,
         (source.settlement_date or source.event_date).isoformat(),
     )
+    typical = _typical_salary_home(dataset, ctx, salaries)
+    if typical:
+        amount_home = typical
     anchor = facts.salary_payday if facts and facts.salary_payday else (
         source.settlement_date or source.event_date
     )
-    return _salary_series(amount_home, anchor, covered, request_date, horizon, source.event_id)
+    return _salary_series(
+        amount_home, anchor, covered, request_date, horizon, source.event_id, first_override
+    )
+
+
+def _is_monthly_rent(event: Event) -> bool:
+    desc = event.description.lower()
+    if "outstanding" in desc or "balance due" in desc:
+        return False
+    return event.category == "rent" or "monthly rent" in desc
 
 
 def _salary_series(
@@ -286,6 +346,7 @@ def _salary_series(
     request_date: date,
     horizon: date,
     source_id: str,
+    first_amount: Optional[float] = None,
 ) -> list[CashFlow]:
     cursor = anchor
     if cursor < request_date:
@@ -299,16 +360,17 @@ def _salary_series(
             abs((cursor - day).days) <= 3 and "salary" in sk for sk, day in covered
         )
         if cursor >= request_date and not nearby_explicit:
+            pay = first_amount if index == 0 and first_amount is not None else amount_home
             projected.append(
                 CashFlow(
                     on_date=cursor,
-                    amount=amount_home,
+                    amount=pay,
                     event_id=f"{source_id}:salary:{index}",
                     series_key=key,
                     category="salary",
                     essential=False,
                     source="projected",
-                    original_amount=amount_home,
+                    original_amount=pay,
                     description="confirmed salary",
                 )
             )
@@ -331,6 +393,50 @@ def _next_month(day: date) -> date:
     return date(day.year, day.month + 1, 1)
 
 
+def _next_payday(ctx: RequestContext, request_date: date) -> Optional[date]:
+    if ctx.evidence and ctx.evidence.stop_future_salary:
+        future = []
+        for event in ctx.events:
+            if not _is_salary_event(event) or event.status in IGNORE_STATUS:
+                continue
+            if event.status == "pending":
+                continue
+            settle = event.settlement_date or event.event_date
+            if settle and settle > request_date:
+                future.append(settle)
+        return min(future) if future else None
+    future: list[date] = []
+    past: list[date] = []
+    for event in ctx.events:
+        if not _is_salary_event(event):
+            continue
+        if event.status in IGNORE_STATUS or event.status == "pending":
+            continue
+        settle = event.settlement_date or event.event_date
+        if settle is None:
+            continue
+        (future if settle > request_date else past).append(settle)
+    if future:
+        return min(future)
+    facts = ctx.evidence
+    if facts and facts.salary_payday:
+        cursor = facts.salary_payday
+        while cursor <= request_date:
+            cursor = _add_months(cursor, 1)
+        return cursor
+    if facts and facts.salary_from_date:
+        cursor = facts.salary_from_date
+        while cursor <= request_date:
+            cursor = _add_months(cursor, 1)
+        return cursor
+    if not past:
+        return None
+    cursor = max(past)
+    while cursor <= request_date:
+        cursor = _add_months(cursor, 1)
+    return cursor
+
+
 def _days_in_month(day: date) -> int:
     start = day.replace(day=1)
     return (_next_month(start) - start).days
@@ -341,6 +447,8 @@ def _variable_envelope(totals: list[float]) -> float:
     if len(totals) < 2:
         return 0.0
     recent = totals[-3:]
+    if FLAGS.get("var_max"):
+        return float(max(recent))
     return float(median(recent))
 
 
@@ -379,6 +487,16 @@ def _project_variable_categories(
     dim = _days_in_month(request_date)
     remainder_end = _next_month(first_of_request_month) - timedelta(days=1)
     daily_cats = {"groceries", "transport"}
+    if FLAGS.get("lump_daily_to_payday"):
+        daily_cats = daily_cats | {"dining", "shopping", "entertainment"}
+    payday = _next_payday(ctx, request_date)
+    daily_end = remainder_end
+    # Groceries/transport after payday are already covered by next month's envelope.
+    # Burning them through month-end stacked on installment dates.
+    if payday and (FLAGS.get("daily_until_payday", True)):
+        daily_end = min(remainder_end, payday - timedelta(days=1))
+    ended = bool(ctx.evidence and ctx.evidence.stop_future_salary)
+    disc = {"dining", "shopping", "entertainment"}
     for category, totals in months_by_cat.items():
         if category not in daily_cats:
             continue
@@ -388,17 +506,61 @@ def _project_variable_categories(
         event = sample_event[category]
         daily = envelope / dim
         day = request_date + timedelta(days=1)
-        while day <= remainder_end and day <= horizon:
+        while day <= daily_end and day <= horizon:
             projected.append(
                 _variable_flow(dataset, ctx, event, day, daily, "daily")
             )
             day += timedelta(days=1)
+    # Extra discretionary burn only for amount_safe / lump-sum today.
+    # Installment simulate ignores conservative_only flows.
+    if not ended:
+        for category, totals in months_by_cat.items():
+            if category not in disc:
+                continue
+            envelope = _variable_envelope(totals)
+            if envelope <= 0 or dim <= 0:
+                continue
+            event = sample_event[category]
+            daily = envelope / dim
+            day = request_date + timedelta(days=1)
+            while day <= daily_end and day <= horizon:
+                projected.append(
+                    _variable_flow(
+                        dataset, ctx, event, day, daily, "daily_cons", conservative_only=True
+                    )
+                )
+                day += timedelta(days=1)
+
+    if FLAGS.get("prepay") and payday and payday > request_date + timedelta(days=1) and dim > 0:
+        charge = payday - timedelta(days=1)
+        frac = min(1.0, max(0.0, (charge - request_date).days / dim))
+        frac *= float(FLAGS.get("prepay_scale") or 1.0)
+        lump_cats = {"dining", "shopping", "entertainment"}
+        if charge <= horizon and frac > 0:
+            for category, totals in months_by_cat.items():
+                if category not in lump_cats:
+                    continue
+                envelope = _variable_envelope(totals)
+                if envelope <= 0:
+                    continue
+                projected.append(
+                    _variable_flow(
+                        dataset,
+                        ctx,
+                        sample_event[category],
+                        charge,
+                        envelope * frac,
+                        "prepay",
+                    )
+                )
 
     cursor = _next_month(first_of_request_month)
     while cursor <= horizon:
         for category, totals in months_by_cat.items():
             envelope = _variable_envelope(totals)
             if envelope <= 0:
+                continue
+            if ended and category in disc:
                 continue
             event = sample_event[category]
             charge_day = date(cursor.year, cursor.month, min(28, max(1, request_date.day)))
@@ -418,11 +580,12 @@ def _variable_flow(
     on_date: date,
     amount: float,
     kind: str,
+    conservative_only: bool = False,
 ) -> CashFlow:
     return CashFlow(
         on_date=on_date,
         amount=-amount,
-        event_id=f"var:{event.category}:{kind}:{on_date.isoformat()}",
+        event_id=f"{event.event_id}:proj:{kind}:{on_date.isoformat()}",
         series_key=f"variable|{event.category}",
         category=event.category,
         essential=event.category in ctx.profile.expense_categories_to_protect,
@@ -432,4 +595,5 @@ def _variable_flow(
         original_amount=amount,
         minimum_allowed_amount=_min_allowed_home(dataset, ctx, event, on_date),
         description=event.description,
+        conservative_only=conservative_only,
     )

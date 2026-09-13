@@ -13,23 +13,30 @@ code/
 ├── image_reader.py      # One-shot VLM JSON for 16 PNGs; fill blank event amounts
 ├── forecaster.py        # 90-day balance simulation
 ├── planner.py           # Generate & rank payment plans
+├── explain_writer.py    # GLM polish of decision_explanation after numbers lock
 ├── validator.py         # Deterministic output checks (bounds, plan match, flexible-only changes)
 ├── evaluator.py         # Score against sample_requests.csv
+├── run_ablations.py     # DEV-only forecast variants (use_llm=False)
 └── evaluation/
     └── usage_report.md  # Required for submission — token/cost summary
 ```
 
 ## Pipeline per request
 
-1. Load user profile + events up to `request_date`
-2. Apply messages/images to amend/cancel/confirm facts
-3. Build recurring schedule + one-time future cash flows
-4. Compute `amount_safe_to_pay` and `earliest_date_for_full_payment`
-5. Enumerate eligible plans: full, partial, each installment option, wait, spending-change variants
-6. Filter by 90-day safety + user preferences + `max_installment_months`
-7. Rank surviving plans per tie-break rules
-8. Generate `decision_explanation`
-9. Validate output schema before writing row
+**Startup (once):**
+
+1. `Dataset.load()` — read all CSVs into memory
+2. `ensure_image_facts(dataset)` — 16 vision calls max; write/read `code/cache/image_facts.json`
+3. Build global `amount_overrides: dict[event_id, float]`
+
+**Per request (250×):**
+
+1. `dataset.for_request(request_id)` — slice user profile, events, messages, options
+2. Attach `amount_overrides` (lookup only; no vision)
+3. `parse_evidence` — messages (separate per-request cache in `message_facts.json`)
+4. `build_cashflows` — blank event amounts filled from overrides
+5. `decide` + `validate` → output row
+6. `polish_explanation` — GLM rewrite; cache `code/cache/explanations.json`. Must not change scored numeric fields.
 
 ## Design choices (open)
 
@@ -42,5 +49,9 @@ code/
 
 ```bash
 python3 code/main.py                    # full dataset → output.csv
-python3 code/main.py --eval-samples     # optional: score against sample_requests.csv
+python3 code/main.py --eval-samples     # DEV 15 vs sample gold
+python3 code/main.py --eval-samples --eval-split holdout
+python3 code/main.py --refresh-images   # re-run 16-image vision extract
+python3 code/main.py --no-llm           # skip GLM/vision; rules + image cache still apply
+python3 code/run_ablations.py           # DEV forecast variants
 ```

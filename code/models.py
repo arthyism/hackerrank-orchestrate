@@ -11,8 +11,14 @@ def parse_date(value: str) -> Optional[date]:
     value = (value or "").strip()
     if not value:
         return None
-    year, month, day = value.split("-")
-    return date(int(year), int(month), int(day))
+    parts = value.split("-")
+    if len(parts) != 3:
+        return None
+    year, month, day = parts
+    try:
+        return date(int(year), int(month), int(day))
+    except ValueError:
+        return None
 
 
 def parse_float(value: str) -> Optional[float]:
@@ -125,6 +131,7 @@ class CashFlow:
     original_amount: float = 0.0
     minimum_allowed_amount: Optional[float] = None
     description: str = ""
+    conservative_only: bool = False
 
 
 @dataclass
@@ -179,6 +186,12 @@ class EvidenceFacts:
     salary_currency: Optional[str] = None
     salary_from_date: Optional[date] = None
     salary_payday: Optional[date] = None
+    next_salary_amount: Optional[float] = None
+    next_salary_currency: Optional[str] = None
     stop_future_salary: bool = False
     ignore_event_ids: list[str] = field(default_factory=list)
+    cancel_event_ids: list[str] = field(default_factory=list)
+    event_amount_overrides: dict[str, float] = field(default_factory=dict)
+    rent_increase_percent: Optional[float] = None
+    skip_internal_transfers: bool = False
     notes: str = ""

@@ -9,7 +9,8 @@ Usage:
   python3 code/main.py --eval-samples              # 15-row DEV split
   python3 code/main.py --eval-samples --eval-split holdout
   python3 code/main.py --request request_01
-  python3 code/main.py
+  python3 code/main.py --limit 50          # first 50 eval rows, resume-safe
+  python3 code/main.py                     # remaining rows (skips ids already in output.csv)
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from evaluator import (  # noqa: E402
     score_row,
 )
 from image_reader import ensure_image_facts  # noqa: E402
+from explain_writer import polish_explanation  # noqa: E402
 from message_parser import parse_evidence  # noqa: E402
 from models import Decision, Request  # noqa: E402
 from planner import decide  # noqa: E402
@@ -65,36 +67,107 @@ def run_request(
         facts.salary_amount
         or facts.stop_future_salary
         or facts.ignore_event_ids
-        or facts.salary_payday
+        or         facts.salary_payday
+        or facts.next_salary_amount
+        or facts.rent_increase_percent
+        or facts.cancel_event_ids
     ):
         print(
             f"  {request.request_id} evidence: salary={facts.salary_amount} "
-            f"{facts.salary_currency or ''} from={facts.salary_from_date} "
-            f"payday={facts.salary_payday} stop={facts.stop_future_salary} "
-            f"ignore={facts.ignore_event_ids}"
+            f"{facts.salary_currency or ''} next={facts.next_salary_amount} "
+            f"from={facts.salary_from_date} payday={facts.salary_payday} "
+            f"stop={facts.stop_future_salary} rent+={facts.rent_increase_percent} "
+            f"cancel={facts.cancel_event_ids} ignore={facts.ignore_event_ids}"
         )
     build_cashflows(dataset, ctx)
     decision = decide(ctx)
-    return validate(ctx, decision)
+    decision = validate(ctx, decision)
+    return polish_explanation(ctx, decision, use_llm=use_llm)
 
 
 def write_csv(path: Path, rows: list[Decision]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
         writer.writeheader()
         for row in rows:
-            writer.writerow(
-                {
-                    "request_id": row.request_id,
-                    "amount_safe_to_pay": row.amount_safe_to_pay,
-                    "affordability_status": row.affordability_status,
-                    "recommended_payment_method": row.recommended_payment_method,
-                    "payment_plan": row.payment_plan,
-                    "earliest_date_for_full_payment": row.earliest_date_for_full_payment,
-                    "spending_changes_needed": row.spending_changes_needed,
-                    "decision_explanation": row.decision_explanation,
-                }
-            )
+            writer.writerow(_row_dict(row))
+    tmp.replace(path)
+
+
+def _row_dict(row: Decision) -> dict[str, object]:
+    return {
+        "request_id": row.request_id,
+        "amount_safe_to_pay": row.amount_safe_to_pay,
+        "affordability_status": row.affordability_status,
+        "recommended_payment_method": row.recommended_payment_method,
+        "payment_plan": row.payment_plan,
+        "earliest_date_for_full_payment": row.earliest_date_for_full_payment,
+        "spending_changes_needed": row.spending_changes_needed,
+        "decision_explanation": row.decision_explanation,
+    }
+
+
+def _decision_from_csv(row: dict[str, str]) -> Decision:
+    return Decision(
+        request_id=row["request_id"],
+        amount_safe_to_pay=float(row["amount_safe_to_pay"]) if row["amount_safe_to_pay"] else 0.0,
+        affordability_status=row["affordability_status"],
+        recommended_payment_method=row["recommended_payment_method"],
+        payment_plan=row["payment_plan"],
+        earliest_date_for_full_payment=row["earliest_date_for_full_payment"],
+        spending_changes_needed=row["spending_changes_needed"],
+        decision_explanation=row.get("decision_explanation") or "",
+    )
+
+
+def load_output_rows(path: Path) -> dict[str, Decision]:
+    if not path.exists():
+        return {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        return {row["request_id"]: _decision_from_csv(row) for row in csv.DictReader(handle)}
+
+
+def run_eval_dataset(
+    dataset: Dataset,
+    *,
+    use_llm: bool,
+    amount_overrides: dict[str, float] | None,
+    out_path: Path,
+    limit: int | None,
+) -> int:
+    done = load_output_rows(out_path)
+    pending = [req for req in dataset.eval_requests if req.request_id not in done]
+    if limit is not None:
+        pending = pending[: max(0, limit)]
+    print(
+        f"Eval run llm={'on' if use_llm else 'off'}  "
+        f"already={len(done)}  this_batch={len(pending)}  "
+        f"total={len(dataset.eval_requests)}  out={out_path}",
+        flush=True,
+    )
+    for request in pending:
+        print(
+            f"[{len(done)+1}/{len(dataset.eval_requests)}] {request.request_id}",
+            flush=True,
+        )
+        decision = run_request(
+            dataset, request, use_llm=use_llm, amount_overrides=amount_overrides
+        )
+        done[decision.request_id] = decision
+        write_csv(out_path, _ordered_rows(dataset, done))
+        print(
+            f"  {decision.affordability_status}/{decision.recommended_payment_method} "
+            f"safe={decision.amount_safe_to_pay} plan={decision.payment_plan}",
+            flush=True,
+        )
+    print(f"Wrote {len(done)} rows to {out_path}", flush=True)
+    return 0
+
+
+def _ordered_rows(dataset: Dataset, done_map: dict[str, Decision]) -> list[Decision]:
+    return [done_map[req.request_id] for req in dataset.eval_requests if req.request_id in done_map]
 
 
 def eval_samples(
@@ -178,6 +251,12 @@ def main() -> int:
     )
     parser.add_argument("--request", help="Run a single request_id")
     parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Process at most N unfinished eval requests (resume-safe)",
+    )
+    parser.add_argument(
         "--out",
         default=str(ROOT / "output.csv"),
         help="Output CSV path (default: repo-root output.csv)",
@@ -212,14 +291,13 @@ def main() -> int:
         )
         return 0
 
-    rows = [
-        run_request(dataset, request, use_llm=use_llm, amount_overrides=amount_overrides)
-        for request in dataset.eval_requests
-    ]
-    out_path = Path(args.out)
-    write_csv(out_path, rows)
-    print(f"Wrote {len(rows)} rows to {out_path}")
-    return 0
+    return run_eval_dataset(
+        dataset,
+        use_llm=use_llm,
+        amount_overrides=amount_overrides,
+        out_path=Path(args.out),
+        limit=args.limit,
+    )
 
 
 if __name__ == "__main__":

@@ -100,3 +100,29 @@ If two totals disagree (8,528.10 vs Grand Total 8,528), keep the labeled grand t
 ## Cost / models
 
 Locked: OpenCode Go `deepseek-v4-flash-vision-exp` via `/v1/chat/completions` with PNG as `data:image/png;base64,...`. Text models on Go are **not** vision-capable. Record tokens in `evaluation/usage_report.md`. Keep the cash engine deterministic after amounts are filled. Details: [`llm-stack.md`](llm-stack.md).
+
+## Implementation (wired 2026-09-13)
+
+**Module:** `code/image_reader.py`  
+**Cache:** `code/cache/image_facts.json` (gitignored; keyed by `event_id`)  
+**Hook:** `main.py` calls `ensure_image_facts(dataset)` once after `Dataset.load()`; passes `amount_overrides` into every `run_request`.
+
+```text
+Dataset.load()
+ensure_image_facts()     ← read cache; vision-call only missing keys (max 16 ever)
+run_request(...)         ← ctx.amount_overrides = global dict; no PNG reads
+state_builder            ← if event.amount is None, use amount_overrides[event_id]
+```
+
+Commands:
+
+```bash
+python3 code/test_vision.py              # single-image smoke test (image_05)
+python3 code/main.py --refresh-images   # delete cache and re-extract all 16
+```
+
+**DeepSeek vision quirk:** responses may land in `reasoning_content` with empty `content` when `max_tokens` is too low. `image_reader` reads both fields and uses `max_tokens=2500`.
+
+**Handwritten `image_14`:** verified TOTAL **4543** (vision misread 4593; corrected via `VERIFIED_AMOUNT_CORRECTIONS` in `image_reader.py`).
+
+Per-request cost after cache warm: **0 vision calls** (~360ms load vs ~40s cold extract).

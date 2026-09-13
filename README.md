@@ -16,6 +16,8 @@ A recommendation is safe only if the user can complete the full payment plan, co
 
 Read [`problem_statement.md`](./problem_statement.md) for the full task spec, input/output schema, allowed values, conflict-resolution rules, and submission format.
 
+**This submission:** deterministic 90-day cash engine; OpenCode Go only for images, leftover messages, and explanation polish. Approach, modules, and run commands: [`code/README.md`](./code/README.md). Token report: [`evaluation/usage_report.md`](./evaluation/usage_report.md).
+
 ---
 
 ## Quick Start

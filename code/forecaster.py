@@ -15,6 +15,7 @@ def simulate(
     extra_debits: Optional[list[tuple[date, float]]] = None,
     stopped_event_ids: Optional[set[str]] = None,
     reduced: Optional[dict[str, float]] = None,
+    conservative: bool = False,
 ) -> tuple[bool, float]:
     """Return (never_below_minimum, lowest_balance)."""
     stopped_event_ids = stopped_event_ids or set()
@@ -26,6 +27,8 @@ def simulate(
 
     for flow in ctx.cashflows:
         if flow.on_date < start or flow.on_date > end:
+            continue
+        if flow.conservative_only and not conservative:
             continue
         if _is_stopped(flow, stopped_event_ids):
             continue
@@ -59,13 +62,13 @@ def simulate(
 
 def amount_safe_today(ctx: RequestContext) -> float:
     requested = ctx.request.requested_amount
-    if _safe_payment(ctx, [(ctx.request.request_date, requested)]):
+    if _safe_payment(ctx, [(ctx.request.request_date, requested)], conservative=True):
         return _round_money(requested)
     lo, hi = 0.0, requested
     best = 0.0
     for _ in range(40):
         mid = (lo + hi) / 2
-        if _safe_payment(ctx, [(ctx.request.request_date, mid)]):
+        if _safe_payment(ctx, [(ctx.request.request_date, mid)], conservative=True):
             best = mid
             lo = mid
         else:
@@ -78,7 +81,7 @@ def earliest_full_payment(ctx: RequestContext) -> Optional[date]:
     start = ctx.request.request_date
     for offset in range(FORECAST_DAYS + 1):
         day = start + timedelta(days=offset)
-        if _safe_payment(ctx, [(day, requested)]):
+        if _safe_payment(ctx, [(day, requested)], conservative=True):
             return day
     return None
 
@@ -88,8 +91,15 @@ def _safe_payment(
     payments: Iterable[tuple[date, float]],
     stopped: Optional[set[str]] = None,
     reduced: Optional[dict[str, float]] = None,
+    conservative: bool = False,
 ) -> bool:
-    ok, _ = simulate(ctx, extra_debits=list(payments), stopped_event_ids=stopped, reduced=reduced)
+    ok, _ = simulate(
+        ctx,
+        extra_debits=list(payments),
+        stopped_event_ids=stopped,
+        reduced=reduced,
+        conservative=conservative,
+    )
     return ok
 
 
