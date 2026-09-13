@@ -1,0 +1,55 @@
+---
+description: Persist crucial findings to doc/KNOWLEDGE.md so all agents share context
+alwaysApply: true
+---
+
+# Workspace Knowledge Base
+
+Every workspace keeps shared agent memory in `doc/`.
+
+## Files
+
+| Path | Purpose |
+|------|---------|
+| `doc/KNOWLEDGE.md` | Master knowledge file — read first in new sessions |
+| `doc/chunks/*.md` | Optional topic-specific deep dives |
+| `doc/README.md` | Usage guide for humans and agents |
+
+If `doc/KNOWLEDGE.md` is missing, tell the user to run `/setup`.
+
+## When To Write
+
+After any **new finding**, **crucial decision**, **architecture choice**, **bug root cause**, or **blocker resolution**:
+
+1. Read `doc/KNOWLEDGE.md` (and relevant `doc/chunks/` files).
+2. Update the matching section immediately — do not wait for the user to ask.
+3. If info conflicts with existing content, note the conflict in `## Open Questions` and ask the user before overwriting.
+4. Append a one-line entry to `## Changelog`.
+
+Do **not** store secrets, API keys, tokens, or sensitive PII. Redact as `[REDACTED]`.
+
+## What To Capture
+
+- Project goals, current status, and next steps
+- Key technical decisions and rationale
+- Non-obvious bugs, fixes, and gotchas
+- File paths, commands, and conventions agents must follow
+- Open questions and unresolved conflicts
+
+Skip transient chatter, failed attempts unless instructive, and info already in `AGENTS.md` / `README.md` unless the chat adds new interpretation.
+
+## User Commands
+
+| Command | Skill | Action |
+|---------|-------|--------|
+| `/setup` | `setup` | Scaffold doc/ + rule |
+| `/recall` | `recall` | Load KB into session |
+| `/ingest` | `ingest` | Summarize chat vs KB; user picks chunks to persist |
+
+## Section Template
+
+Keep `doc/KNOWLEDGE.md` sections in this order:
+
+`Project Summary` → `Current Status` → `Key Decisions` → `Architecture & Approach` → `Important Findings` → `Open Questions` → `Topics Index` → `Changelog`
+
+When adding a large topic, create `doc/chunks/<topic-slug>.md` and link it from `Topics Index`.
